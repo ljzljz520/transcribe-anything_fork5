@@ -49,11 +49,14 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from transcribe_anything.server_config import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    IDEMPOTENCY_COMMITTED,
+    IDEMPOTENCY_IN_FLIGHT,
     WS_CLOSE_BUSY,
     WS_CLOSE_DURATION_EXCEEDED,
     WS_CLOSE_INTERNAL,
     WS_CLOSE_NOT_ALLOWED,
     WS_CLOSE_UNAUTHORIZED,
+    IdempotencyRecord,
     Job,
     JobStatus,
     JobStore,
@@ -72,6 +75,7 @@ from transcribe_anything.server_config import (
     config_from_env,
     config_to_env,
     is_model_cached,
+    make_request_fingerprint,
     validate_request_options,
 )
 
@@ -229,7 +233,7 @@ def create_app(
     async def submit(
         request: Request,
         _: None = Depends(_auth_dep),
-    ) -> dict:
+    ) -> Response:
         if config.prefetch == "none" and not is_model_cached(config.model):
             raise HTTPException(
                 status_code=503,
@@ -237,9 +241,29 @@ def create_app(
             )
 
         content_type = (request.headers.get("content-type") or "").lower()
+        # Raises 400 before we touch the filesystem for a malformed key.
+        idem_key = _validate_idempotency_key(request.headers.get("idempotency-key"))
         artifact_dir = Path(tempfile.mkdtemp(prefix="ta-job-", dir=str(job_root)))
 
+        # Two-phase idempotency (issue: duplicate inference on retries):
+        #   * reserve the key BEFORE streaming the upload so a concurrent
+        #     duplicate is rejected without a second media landing on disk;
+        #   * COMMIT only after the job is enqueued; any other outcome
+        #     RELEASES the key and removes the fresh upload directory.
+        existing: Optional[IdempotencyRecord] = None
+        key_reserved_by_us = False
         try:
+            if idem_key is not None:
+                existing = store.reserve_idempotency_key(idem_key)
+                if existing is None:
+                    key_reserved_by_us = True
+                elif existing.state == IDEMPOTENCY_IN_FLIGHT:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(f"a request with Idempotency-Key {idem_key!r} is already being processed; " "concurrent requests sharing a key are rejected"),
+                    )
+
+            media_digest: str
             if "multipart/form-data" in content_type:
                 form = await request.form()
                 upload = form.get("file")
@@ -255,7 +279,7 @@ def create_app(
                         options = json.loads(opts_raw)
                     except json.JSONDecodeError as exc:
                         raise HTTPException(status_code=400, detail=f"options JSON invalid: {exc}") from exc
-                input_path = _save_upload(upload, artifact_dir, config.max_upload_size_bytes)
+                input_path, media_digest = _save_upload(upload, artifact_dir, config.max_upload_size_bytes)
             else:
                 try:
                     body = await request.json()
@@ -268,29 +292,59 @@ def create_app(
                     raise HTTPException(status_code=400, detail="JSON submission requires a 'url' field")
                 options = {k: v for k, v in body.items() if k != "url"}
                 input_path = url
+                media_digest = f"url:{url}"
 
             try:
                 normalized = validate_request_options(options, config)
             except SettingsViolation as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+            fingerprint = make_request_fingerprint(media_digest, normalized)
+
+            if existing is not None and existing.state == IDEMPOTENCY_COMMITTED:
+                # The retry's bytes are already spooled into artifact_dir;
+                # discard them either way — the original job owns its dir.
+                if existing.fingerprint != fingerprint:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(f"Idempotency-Key {idem_key!r} was already used with a different request " "(media content or parameters differ)"),
+                    )
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+                # Replaying is the successful path: it must not look like a
+                # rollback to the except clause below.
+                key_reserved_by_us = False
+                return JSONResponse(
+                    existing.response,
+                    status_code=202,
+                    headers={"Idempotent-Replay": "true"},
+                )
+
             job_request = {"input": input_path, **normalized}
             try:
                 job = store.submit(job_request, str(artifact_dir))
             except QueueFull as exc:
                 raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+            response_body = {
+                "job_id": job.job_id,
+                "status": job.status.value,
+                "status_url": f"/v1/jobs/{job.job_id}",
+            }
+            if idem_key is not None:
+                store.commit_idempotency_record(idem_key, fingerprint, job.job_id, response_body)
+            # Job enqueued + key committed: nothing to roll back anymore.
+            key_reserved_by_us = False
+            return JSONResponse(response_body, status_code=202)
         except HTTPException:
+            if key_reserved_by_us and idem_key is not None:
+                store.release_idempotency_key(idem_key)
             shutil.rmtree(artifact_dir, ignore_errors=True)
             raise
         except Exception:
+            if key_reserved_by_us and idem_key is not None:
+                store.release_idempotency_key(idem_key)
             shutil.rmtree(artifact_dir, ignore_errors=True)
             raise
-
-        return {
-            "job_id": job.job_id,
-            "status": job.status.value,
-            "status_url": f"/v1/jobs/{job.job_id}",
-        }
 
     @app.get("/v1/jobs/{job_id}")
     def get_job(job_id: str, _: None = Depends(_auth_dep)) -> dict:
@@ -507,12 +561,37 @@ def create_app(
     return app
 
 
-def _save_upload(upload, dest_dir: Path, max_bytes: int) -> str:
-    """Stream an UploadFile to ``dest_dir``, enforcing ``max_bytes``."""
+def _validate_idempotency_key(raw: Optional[str]) -> Optional[str]:
+    """Normalize the ``Idempotency-Key`` header or raise 400.
+
+    Absent / whitespace-only -> ``None`` (feature stays opt-in). The key
+    is an opaque client-chosen token: cap its length and reject control
+    characters so it can be used safely in logs and as a map key.
+    """
+    if raw is None:
+        return None
+    key = raw.strip()
+    if not key:
+        return None
+    if len(key) > 255 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in key):
+        raise HTTPException(status_code=400, detail="invalid Idempotency-Key header: must be <= 255 visible characters")
+    return key
+
+
+def _save_upload(upload, dest_dir: Path, max_bytes: int) -> tuple:
+    """Stream an UploadFile to ``dest_dir``, enforcing ``max_bytes``.
+
+    Returns ``(saved_path, media_digest)`` where the digest is a
+    content-addressed ``sha256:<hexdigest>`` fed while streaming, so
+    idempotency retries never re-read the spooled file.
+    """
+    import hashlib
+
     filename = getattr(upload, "filename", None) or "upload.bin"
     safe = Path(filename).name
     out = dest_dir / "_input" / safe
     out.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
     total = 0
     with open(out, "wb") as fh:
         while True:
@@ -520,6 +599,7 @@ def _save_upload(upload, dest_dir: Path, max_bytes: int) -> str:
             if not chunk:
                 break
             total += len(chunk)
+            digest.update(chunk)
             if total > max_bytes:
                 fh.close()
                 try:
@@ -528,7 +608,7 @@ def _save_upload(upload, dest_dir: Path, max_bytes: int) -> str:
                     pass
                 raise HTTPException(status_code=413, detail=f"upload exceeds max-upload-size {max_bytes} bytes")
             fh.write(chunk)
-    return str(out)
+    return str(out), f"sha256:{digest.hexdigest()}"
 
 
 def run_server(config: ServerConfig) -> None:

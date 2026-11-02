@@ -17,8 +17,9 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -27,14 +28,100 @@ class RemoteTranscriberError(Exception):
     """Raised when a remote daemon rejects or fails a transcription request."""
 
 
-def _build_headers(token: Optional[str]) -> dict:
-    if not token:
-        return {}
-    return {"Authorization": f"Bearer {token}"}
+# Submission is retried only when the response could have been lost
+# (connection/timeout transport errors) or when the daemon could not
+# definitively process the request. 4xx (incl. 409 key conflicts, 429
+# queue full, 400 validation) are terminal: retrying them blindly would
+# either mask a caller bug or hammer a saturated queue.
+SUBMIT_MAX_ATTEMPTS = 3
+RETRYABLE_SUBMIT_STATUSES = {502, 503, 504}
+_RETRY_BACKOFF_BASE_SECONDS = 0.05
+
+
+def _build_headers(token: Optional[str], idempotency_key: Optional[str] = None) -> dict:
+    headers: dict = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
 
 
 def _normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
+
+
+def _resolve_idempotency_key(idempotency_key: Optional[str]) -> str:
+    """Use the caller's key or mint one per logical call.
+
+    A freshly minted key protects the client's own bounded retries: if
+    the daemon enqueued the job but the 202 was lost on the wire, the
+    retry carries the same token and gets the original job back instead
+    of triggering a second inference.
+    """
+    return idempotency_key or uuid.uuid4().hex
+
+
+def _submit_with_retries(
+    send_attempt: Callable[[], "httpx.Response"],
+    *,
+    base_url: str,
+    max_attempts: int = SUBMIT_MAX_ATTEMPTS,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> "httpx.Response":
+    """Sync bounded-retry wrapper around the POST /v1/transcribe call.
+
+    Every attempt sends the SAME Idempotency-Key (set on the client
+    headers by the caller), so a retry after a lost response can never
+    enqueue twice.
+    """
+    sleep_fn = sleep if sleep is not None else time.sleep
+    last_response: Optional[httpx.Response] = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            response = send_attempt()
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt + 1 >= max_attempts:
+                raise RemoteTranscriberError(f"lost connection submitting to {base_url} after {max_attempts} attempts: {exc}") from exc
+            sleep_fn(_RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
+            continue
+        last_response = response
+        if response.status_code in RETRYABLE_SUBMIT_STATUSES and attempt + 1 < max_attempts:
+            sleep_fn(_RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
+            continue
+        return response
+    # Unreachable while max_attempts >= 1; keeps type checkers honest.
+    raise RemoteTranscriberError(f"daemon at {base_url} kept failing submission: {last_response or last_exc}")
+
+
+async def _submit_with_retries_async(
+    send_attempt: Callable[[], Any],
+    *,
+    base_url: str,
+    max_attempts: int = SUBMIT_MAX_ATTEMPTS,
+    sleep: Optional[Callable[[float], Any]] = None,
+) -> "httpx.Response":
+    """Async mirror of :func:`_submit_with_retries`."""
+    sleep_fn = sleep if sleep is not None else asyncio.sleep
+    last_response: Optional[httpx.Response] = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(max_attempts):
+        try:
+            response = await send_attempt()
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt + 1 >= max_attempts:
+                raise RemoteTranscriberError(f"lost connection submitting to {base_url} after {max_attempts} attempts: {exc}") from exc
+            await sleep_fn(_RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
+            continue
+        last_response = response
+        if response.status_code in RETRYABLE_SUBMIT_STATUSES and attempt + 1 < max_attempts:
+            await sleep_fn(_RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
+            continue
+        return response
+    raise RemoteTranscriberError(f"daemon at {base_url} kept failing submission: {last_response or last_exc}")
 
 
 def _collect_options(
@@ -85,14 +172,24 @@ def transcribe_remote(
     poll_interval_seconds: float = 1.0,
     request_timeout_seconds: float = 30.0,
     job_timeout_seconds: float = 60 * 60 * 4,
+    idempotency_key: Optional[str] = None,
+    submit_max_attempts: int = SUBMIT_MAX_ATTEMPTS,
 ) -> str:
     """Submit a transcription job to a remote daemon and download artifacts locally.
 
     Returns the absolute path to the output directory, matching the shape
     of :func:`transcribe_anything.api.transcribe`.
+
+    ``idempotency_key`` is optional: pass a stable token to make a logical
+    request safely retryable across processes, or leave it unset and one
+    is minted for this call. The same key is reused on every bounded
+    submission retry, and the daemon de-duplicates by (key, media,
+    parameters): a repeated request returns the original job while a
+    same-key request with different media/parameters gets a 409.
     """
     base_url = _normalize_base_url(remote)
-    headers = _build_headers(token)
+    idem_key = _resolve_idempotency_key(idempotency_key)
+    headers = _build_headers(token, idem_key)
     options = _collect_options(
         model=model,
         task=task,
@@ -107,19 +204,34 @@ def transcribe_remote(
     # Decide submission mode: URL or multipart file upload.
     is_url = url_or_file.startswith("http://") or url_or_file.startswith("https://") or url_or_file.startswith("ftp://")
 
+    if not is_url:
+        local = Path(url_or_file)
+        if not local.is_file():
+            raise RemoteTranscriberError(f"local file not found: {url_or_file}")
+
     client = httpx.Client(timeout=request_timeout_seconds, headers=headers)
     try:
-        if is_url:
-            payload = {"url": url_or_file, **options}
-            resp = client.post(f"{base_url}/v1/transcribe", json=payload)
-        else:
-            local = Path(url_or_file)
-            if not local.is_file():
-                raise RemoteTranscriberError(f"local file not found: {url_or_file}")
+        submit_url = f"{base_url}/v1/transcribe"
+
+        def _attempt() -> "httpx.Response":
+            # Rebuild the multipart body per attempt: the file handle is
+            # consumed (and closed) by the previous POST.
+            if is_url:
+                payload = {"url": url_or_file, **options}
+                return client.post(submit_url, json=payload)
             with local.open("rb") as fh:
                 files = {"file": (local.name, fh, "application/octet-stream")}
                 data = {"options": json.dumps(options)} if options else {}
-                resp = client.post(f"{base_url}/v1/transcribe", files=files, data=data)
+                return client.post(submit_url, files=files, data=data)
+
+        # Bounded retry after a lost response; the idempotency key makes
+        # a retried enqueue collapse onto the original job.
+        resp = _submit_with_retries(_attempt, base_url=base_url, max_attempts=submit_max_attempts)
+        if resp.status_code == 409:
+            raise RemoteTranscriberError(
+                f"daemon at {base_url} rejected submission with 409 idempotency conflict for key {idem_key!r} "
+                f"(same key reused with different media/parameters, or a concurrent request is in flight): {resp.text}"
+            )
         if resp.status_code >= 400:
             raise RemoteTranscriberError(f"daemon at {base_url} rejected submission: {resp.status_code} {resp.text}")
         body = resp.json()
@@ -186,6 +298,8 @@ async def transcribe_remote_async(
     poll_interval_seconds: float = 1.0,
     request_timeout_seconds: float = 30.0,
     job_timeout_seconds: float = 60 * 60 * 4,
+    idempotency_key: Optional[str] = None,
+    submit_max_attempts: int = SUBMIT_MAX_ATTEMPTS,
 ) -> str:
     """Async mirror of :func:`transcribe_remote`.
 
@@ -194,9 +308,13 @@ async def transcribe_remote_async(
     ``httpx.AsyncClient`` and ``asyncio.sleep`` so callers can drive
     many remote transcriptions concurrently without burning a thread per
     job.
+
+    Like the sync client, an optional ``idempotency_key`` is reused for
+    all bounded submission retries (one is minted per call when unset).
     """
     base_url = _normalize_base_url(remote)
-    headers = _build_headers(token)
+    idem_key = _resolve_idempotency_key(idempotency_key)
+    headers = _build_headers(token, idem_key)
     options = _collect_options(
         model=model,
         task=task,
@@ -210,18 +328,33 @@ async def transcribe_remote_async(
 
     is_url = url_or_file.startswith("http://") or url_or_file.startswith("https://") or url_or_file.startswith("ftp://")
 
+    if not is_url:
+        local = Path(url_or_file)
+        if not local.is_file():
+            raise RemoteTranscriberError(f"local file not found: {url_or_file}")
+
     async with httpx.AsyncClient(timeout=request_timeout_seconds, headers=headers) as client:
-        if is_url:
-            payload = {"url": url_or_file, **options}
-            resp = await client.post(f"{base_url}/v1/transcribe", json=payload)
-        else:
-            local = Path(url_or_file)
-            if not local.is_file():
-                raise RemoteTranscriberError(f"local file not found: {url_or_file}")
+        submit_url = f"{base_url}/v1/transcribe"
+
+        async def _attempt() -> "httpx.Response":
+            # Rebuild the multipart body per attempt: the file handle is
+            # consumed (and closed) by the previous POST.
+            if is_url:
+                payload = {"url": url_or_file, **options}
+                return await client.post(submit_url, json=payload)
             with local.open("rb") as fh:
                 files = {"file": (local.name, fh, "application/octet-stream")}
                 data = {"options": json.dumps(options)} if options else {}
-                resp = await client.post(f"{base_url}/v1/transcribe", files=files, data=data)
+                return await client.post(submit_url, files=files, data=data)
+
+        # Bounded retry after a lost response; the idempotency key makes
+        # a retried enqueue collapse onto the original job.
+        resp = await _submit_with_retries_async(_attempt, base_url=base_url, max_attempts=submit_max_attempts)
+        if resp.status_code == 409:
+            raise RemoteTranscriberError(
+                f"daemon at {base_url} rejected submission with 409 idempotency conflict for key {idem_key!r} "
+                f"(same key reused with different media/parameters, or a concurrent request is in flight): {resp.text}"
+            )
         if resp.status_code >= 400:
             raise RemoteTranscriberError(f"daemon at {base_url} rejected submission: {resp.status_code} {resp.text}")
         body = resp.json()

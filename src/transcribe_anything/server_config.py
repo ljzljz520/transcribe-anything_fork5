@@ -21,6 +21,7 @@ without spinning up the HTTP layer:
 """
 
 import dataclasses
+import hashlib
 import hmac
 import json
 import logging
@@ -128,6 +129,7 @@ class Job:
     completed_at: Optional[float] = None
     error: Optional[str] = None
     artifacts: list = field(default_factory=list)
+    idempotency_key: Optional[str] = None
 
     def to_public_dict(self) -> dict:
         return {
@@ -147,6 +149,53 @@ class QueueFull(Exception):
 
 class SettingsViolation(ValueError):
     """Raised when a client request tries to override a daemon-locked setting."""
+
+
+# Idempotency-record lifecycle states.
+#   in_flight: a request holding the key is still being processed (upload
+#              streamed / job about to be enqueued). A concurrent request
+#              with the same key must be rejected rather than queued.
+#   committed: the job was enqueued; the stored response is replayed to
+#              matching retries until the record hits the retention TTL.
+IDEMPOTENCY_IN_FLIGHT = "in_flight"
+IDEMPOTENCY_COMMITTED = "committed"
+
+
+@dataclass
+class IdempotencyRecord:
+    """Server-side bookkeeping for one ``Idempotency-Key``.
+
+    The index holding these records is purely in-memory, so its scope is
+    bounded to a single daemon run; committed records additionally expire
+    after :attr:`ServerConfig.artifact_ttl_seconds` (the same retention
+    window as the job artifacts they point at).
+    """
+
+    key: str
+    state: str
+    created_at: float
+    expires_at: Optional[float] = None
+    fingerprint: Optional[str] = None
+    job_id: Optional[str] = None
+    response: Optional[dict] = None
+
+
+def make_request_fingerprint(media_digest: str, options: dict) -> str:
+    """Stable hash of the request's media identity + normalized parameters.
+
+    ``media_digest`` identifies the media itself (``"url:<url>"`` for URL
+    submissions or ``"sha256:<hexdigest>"`` for streamed uploads); the
+    daemon-local temp path of an upload is deliberately not part of it.
+    Two retries with identical media and normalized options hash equal;
+    any parameter difference changes the hash and surfaces as a conflict.
+    """
+    canonical = json.dumps(options or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    h = hashlib.sha256()
+    h.update(b"v1\n")
+    h.update(media_digest.encode("utf-8"))
+    h.update(b"\n")
+    h.update(canonical.encode("utf-8"))
+    return h.hexdigest()
 
 
 _DAEMON_LOCKED_FIELDS = ("device", "hf_token", "hugging_face_token", "flash", "prefetch")
@@ -242,6 +291,10 @@ class JobStore:
         # Lifetime job-status counters for /metrics. Keys mirror JobStatus
         # values; we count terminal transitions, not intermediate states.
         self._counts: dict = {s.value: 0 for s in JobStatus}
+        # In-memory Idempotency-Key index. In-memory by design: the scope
+        # is one daemon run, and committed entries additionally expire
+        # after artifact_ttl_seconds. Never persisted to disk.
+        self._idempotency: dict = {}
 
     def start(self) -> None:
         if self._worker is not None:
@@ -280,6 +333,97 @@ class JobStore:
             raise QueueFull("transcription queue is full") from exc
         return job
 
+    # ------------------------------------------------------------------
+    # Idempotency-Key support.
+    #
+    # Two-phase reservation protocol driven by the HTTP handler:
+    #   1. reserve_idempotency_key() BEFORE the upload is streamed: either
+    #      atomically claims the key (in_flight) or returns the existing
+    #      record (concurrent duplicate -> 409, retry -> replay/compare).
+    #   2a. commit_idempotency_record() once the job is safely enqueued.
+    #   2b. release_idempotency_key() on EVERY rollback path (bad body,
+    #       settings violation, queue full, ...) so a failed attempt can
+    #       be retried with the same key.
+    # ------------------------------------------------------------------
+
+    def reserve_idempotency_key(self, key: str) -> Optional[IdempotencyRecord]:
+        """Atomically claim ``key``.
+
+        Returns ``None`` when the key was free and is now held
+        (``in_flight``) by this caller. Returns the existing record when
+        the key is already reserved (concurrent request) or committed
+        (retry candidate). Expired committed records are purged first,
+        after which the key behaves as free.
+        """
+        now = time.time()
+        with self._lock:
+            self._purge_expired_idempotency_locked(now)
+            existing = self._idempotency.get(key)
+            if existing is not None:
+                return existing
+            self._idempotency[key] = IdempotencyRecord(
+                key=key,
+                state=IDEMPOTENCY_IN_FLIGHT,
+                created_at=now,
+            )
+            return None
+
+    def commit_idempotency_record(
+        self,
+        key: str,
+        fingerprint: str,
+        job_id: str,
+        response: dict,
+    ) -> None:
+        """Finalize a reserved key after the job was enqueued successfully.
+
+        Starts the retention TTL clock (``artifact_ttl_seconds``) and
+        stores the exact 202 response that matching retries will replay.
+        """
+        now = time.time()
+        with self._lock:
+            record = self._idempotency.get(key)
+            if record is None:
+                # Handler always reserves first; tolerate a vanished
+                # record rather than failing a job that is already queued.
+                record = IdempotencyRecord(key=key, state=IDEMPOTENCY_IN_FLIGHT, created_at=now)
+                self._idempotency[key] = record
+            record.state = IDEMPOTENCY_COMMITTED
+            record.fingerprint = fingerprint
+            record.job_id = job_id
+            record.response = dict(response)
+            record.expires_at = now + self.config.artifact_ttl_seconds
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.idempotency_key = key
+
+    def release_idempotency_key(self, key: str) -> None:
+        """Roll back an in_flight reservation.
+
+        Committed records are intentionally left untouched — only the
+        request that owns the in_flight reservation may release it.
+        """
+        with self._lock:
+            record = self._idempotency.get(key)
+            if record is not None and record.state == IDEMPOTENCY_IN_FLIGHT:
+                del self._idempotency[key]
+
+    def sweep_expired_idempotency(self) -> None:
+        """Drop committed records past the retention window. Called by the worker loop."""
+        with self._lock:
+            self._purge_expired_idempotency_locked(time.time())
+
+    def _purge_expired_idempotency_locked(self, now: float) -> None:
+        # in_flight records belong to a live request and never expire on
+        # their own; the handler releases them on every rollback path.
+        stale = [k for k, record in self._idempotency.items() if record.state == IDEMPOTENCY_COMMITTED and record.expires_at is not None and record.expires_at <= now]
+        for k in stale:
+            del self._idempotency[k]
+
+    def get_idempotency_record(self, key: str) -> Optional[IdempotencyRecord]:
+        with self._lock:
+            return self._idempotency.get(key)
+
     def snapshot_metrics(self) -> dict:
         """Counters + gauges for the /metrics endpoint."""
         with self._lock:
@@ -300,6 +444,10 @@ class JobStore:
     def delete(self, job_id: str) -> bool:
         with self._lock:
             job = self._jobs.pop(job_id, None)
+            if job is not None and job.idempotency_key:
+                record = self._idempotency.get(job.idempotency_key)
+                if record is not None and record.job_id == job_id:
+                    del self._idempotency[job.idempotency_key]
         if job is None:
             return False
         try:
@@ -319,7 +467,11 @@ class JobStore:
             try:
                 job_id = self._queue.get(timeout=1.0)
             except Empty:
+                # Piggyback retention sweeps on the worker tick so we
+                # don't need a dedicated reaper thread.
+                self.sweep_expired_idempotency()
                 continue
+            self.sweep_expired_idempotency()
             if job_id is None:
                 break
             with self._lock:

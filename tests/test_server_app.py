@@ -19,7 +19,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from transcribe_anything.server_app import (
+    IDEMPOTENCY_COMMITTED,
     JobStatus,
+    JobStore,
     QueueFull,
     ServerConfig,
     SettingsViolation,
@@ -29,6 +31,7 @@ from transcribe_anything.server_app import (
     config_to_env,
     create_app,
     is_model_cached,
+    make_request_fingerprint,
     validate_request_options,
 )
 
@@ -533,3 +536,398 @@ def test_queue_overflow_returns_429(tmp_path) -> None:
             release.set()
     finally:
         release.set()
+
+
+# --------------------- Idempotency-Key ---------------------
+
+
+def _counting_transcribe_factory():
+    """Return (fn, calls): fn writes the usual artifacts and records each invocation."""
+    import threading
+
+    calls: list = []
+    lock = threading.Lock()
+
+    def fake_transcribe(*, url_or_file: str, output_dir: str, **_kwargs):
+        with lock:
+            calls.append(url_or_file)
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "out.txt").write_text("hello world", encoding="utf-8")
+        (out / "out.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
+        (out / "out.vtt").write_text("WEBVTT\n", encoding="utf-8")
+        (out / "out.json").write_text("{}", encoding="utf-8")
+        return str(out)
+
+    return fake_transcribe, calls
+
+
+def _job_dirs(job_root: Path) -> set:
+    return {p for p in job_root.iterdir() if p.name.startswith("ta-job-")}
+
+
+def test_make_request_fingerprint_stable_and_sensitive() -> None:
+    fp = make_request_fingerprint("url:https://x/a.mp3", {"language": "en", "task": "transcribe"})
+    # Option key ordering must not matter.
+    fp_reordered = make_request_fingerprint("url:https://x/a.mp3", {"task": "transcribe", "language": "en"})
+    assert fp == fp_reordered
+    # Different media -> different fingerprint.
+    assert fp != make_request_fingerprint("url:https://x/b.mp3", {"language": "en", "task": "transcribe"})
+    # Different parameters -> different fingerprint.
+    assert fp != make_request_fingerprint("url:https://x/a.mp3", {"language": "fr", "task": "transcribe"})
+
+
+def test_idempotent_replay_returns_same_job_and_infers_once(tmp_path) -> None:
+    """Response-loss scenario: exact retry with same key collapses onto the original job."""
+    job_root = tmp_path / "jobs"
+    fake, calls = _counting_transcribe_factory()
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=fake)
+    with TestClient(app) as client:
+        payload = {"url": "https://example.com/a.mp3", "language": "en"}
+        r1 = client.post("/v1/transcribe", json=payload, headers={"Idempotency-Key": "abc-123"})
+        assert r1.status_code == 202, r1.text
+        assert r1.headers.get("Idempotent-Replay") is None
+        job1 = r1.json()["job_id"]
+        _wait_for_status(client, job1)
+
+        # Simulate the client retrying after losing the 202 (same key, same body).
+        r2 = client.post("/v1/transcribe", json=payload, headers={"Idempotency-Key": "abc-123"})
+        assert r2.status_code == 202, r2.text
+        assert r2.headers.get("Idempotent-Replay") == "true"
+        assert r2.json()["job_id"] == job1
+
+        assert len(calls) == 1  # no duplicate inference
+        # Only the original upload/job directory remains.
+        assert len(_job_dirs(job_root)) == 1
+
+
+def test_idempotent_replay_while_queued_returns_same_job(tmp_path) -> None:
+    """Retry before the worker picked up the job still maps to one enqueue."""
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking(**kwargs):
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        entered.set()
+        release.wait(timeout=5)
+        for name, body in (("out.txt", "x"), ("out.srt", "1\n"), ("out.vtt", "WEBVTT\n"), ("out.json", "{}")):
+            (out / name).write_text(body, encoding="utf-8")
+        return str(out)
+
+    job_root = tmp_path / "jobs"
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", max_queue=4, job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=blocking)
+    try:
+        with TestClient(app) as client:
+            r1 = client.post("/v1/transcribe", json={"url": "https://q"}, headers={"Idempotency-Key": "kq"})
+            assert r1.status_code == 202
+            assert entered.wait(timeout=2)
+            # A second keyed job queues behind the blocked worker; retry
+            # its submission while it is still queued.
+            q1 = client.post("/v1/transcribe", json={"url": "https://r"}, headers={"Idempotency-Key": "kr"})
+            assert q1.status_code == 202
+            q2 = client.post("/v1/transcribe", json={"url": "https://r"}, headers={"Idempotency-Key": "kr"})
+            assert q2.status_code == 202
+            assert q2.headers.get("Idempotent-Replay") == "true"
+            assert q2.json()["job_id"] == q1.json()["job_id"]
+    finally:
+        release.set()
+
+
+def test_same_key_different_parameters_is_conflict(tmp_path) -> None:
+    job_root = tmp_path / "jobs"
+    fake, calls = _counting_transcribe_factory()
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=fake)
+    with TestClient(app) as client:
+        r1 = client.post(
+            "/v1/transcribe",
+            json={"url": "https://example.com/a.mp3", "language": "en"},
+            headers={"Idempotency-Key": "shared"},
+        )
+        assert r1.status_code == 202
+        r2 = client.post(
+            "/v1/transcribe",
+            json={"url": "https://example.com/a.mp3", "language": "fr"},
+            headers={"Idempotency-Key": "shared"},
+        )
+        assert r2.status_code == 409
+        assert "different request" in r2.json()["detail"]
+        # The conflicting attempt leaves no upload directory behind.
+        assert len(_job_dirs(job_root)) == 1
+        assert len(calls) == 1
+
+
+def test_same_key_different_url_is_conflict(tmp_path) -> None:
+    fake, _ = _counting_transcribe_factory()
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(tmp_path))
+    app = create_app(cfg, transcribe_fn=fake)
+    with TestClient(app) as client:
+        assert client.post("/v1/transcribe", json={"url": "https://a"}, headers={"Idempotency-Key": "k"}).status_code == 202
+        conflict = client.post("/v1/transcribe", json={"url": "https://b"}, headers={"Idempotency-Key": "k"})
+        assert conflict.status_code == 409
+        assert "different request" in conflict.json()["detail"]
+
+
+def test_same_key_different_upload_bytes_is_conflict(tmp_path) -> None:
+    job_root = tmp_path / "jobs"
+    fake, calls = _counting_transcribe_factory()
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=fake)
+    f1 = tmp_path / "a.wav"
+    f2 = tmp_path / "b.wav"
+    f1.write_bytes(b"audio-bytes-version-one")
+    f2.write_bytes(b"audio-bytes-version-two-different")
+    with TestClient(app) as client:
+        with f1.open("rb") as fh:
+            r1 = client.post("/v1/transcribe", files={"file": ("a.wav", fh, "audio/wav")}, headers={"Idempotency-Key": "up"})
+        assert r1.status_code == 202
+        _wait_for_status(client, r1.json()["job_id"])
+        with f2.open("rb") as fh:
+            r2 = client.post("/v1/transcribe", files={"file": ("b.wav", fh, "audio/wav")}, headers={"Idempotency-Key": "up"})
+        assert r2.status_code == 409
+        assert "different request" in r2.json()["detail"]
+        assert len(calls) == 1
+        assert len(_job_dirs(job_root)) == 1
+
+
+def test_multipart_replay_after_lost_response_dedupes(tmp_path) -> None:
+    job_root = tmp_path / "jobs"
+    fake, calls = _counting_transcribe_factory()
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=fake)
+    src = tmp_path / "audio.wav"
+    src.write_bytes(b"same-bytes-on-both-attempts")
+    with TestClient(app) as client:
+
+        def submit():
+            with src.open("rb") as fh:
+                return client.post(
+                    "/v1/transcribe",
+                    files={"file": ("audio.wav", fh, "audio/wav")},
+                    data={"options": json.dumps({"language": "en"})},
+                    headers={"Idempotency-Key": "up-replay"},
+                )
+
+        r1 = submit()
+        assert r1.status_code == 202
+        _wait_for_status(client, r1.json()["job_id"])
+        r2 = submit()
+        assert r2.status_code == 202
+        assert r2.headers.get("Idempotent-Replay") == "true"
+        assert r2.json()["job_id"] == r1.json()["job_id"]
+        assert len(calls) == 1
+        assert len(_job_dirs(job_root)) == 1
+
+
+def test_concurrent_same_key_uploads_dedupe(tmp_path) -> None:
+    """Two concurrent uploads, one key: one 202, one 409, one inference, one job dir."""
+    import threading
+
+    job_root = tmp_path / "jobs"
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list = []
+    calls_lock = threading.Lock()
+
+    def blocking(**kwargs):
+        with calls_lock:
+            calls.append(kwargs.get("url_or_file"))
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        entered.set()
+        release.wait(timeout=5)
+        for name, body in (("out.txt", "x"), ("out.srt", "1\n"), ("out.vtt", "WEBVTT\n"), ("out.json", "{}")):
+            (out / name).write_text(body, encoding="utf-8")
+        return str(out)
+
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", max_queue=4, job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=blocking)
+    store = app.state.store
+
+    # Hold the in_flight reservation open until the losing request has
+    # observed it, making the interleaving deterministic.
+    reserve_orig = store.reserve_idempotency_key
+    loser_observed = threading.Event()
+
+    def reserve_then_gate(key):
+        record = reserve_orig(key)
+        if record is None:
+            # Winner: park while the loser races into reserve().
+            assert loser_observed.wait(timeout=5)
+        else:
+            # Loser saw the winner's in_flight reservation.
+            loser_observed.set()
+        return record
+
+    store.reserve_idempotency_key = reserve_then_gate  # type: ignore[method-assign]
+
+    statuses: dict = {}
+
+    def post(thread_name: str):
+        # No context manager: create_app() already started the store,
+        # and each thread needs its own portal (TestClient is not
+        # shareable across threads).
+        client = TestClient(app)
+        resp = client.post("/v1/transcribe", json={"url": "https://race"}, headers={"Idempotency-Key": "race-key"})
+        statuses[thread_name] = resp.status_code
+
+    try:
+        t1 = threading.Thread(target=post, args=("a",))
+        t2 = threading.Thread(target=post, args=("b",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+        assert sorted(statuses.values()) == [202, 409], statuses
+        assert entered.wait(timeout=2)
+    finally:
+        release.set()
+
+    assert len(calls) == 1, calls
+    with store._lock:  # noqa: SLF001 - inspecting internals for the dedupe invariant
+        assert len(store._jobs) == 1
+    assert len(_job_dirs(job_root)) == 1, sorted(p.name for p in job_root.iterdir())
+
+
+def test_queue_full_rolls_back_idempotency_key(tmp_path) -> None:
+    """429 must release the key and clean the upload dir; the key stays reusable."""
+    import threading
+
+    job_root = tmp_path / "jobs"
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list = []
+    calls_lock = threading.Lock()
+
+    def blocking(**kwargs):
+        with calls_lock:
+            calls.append(kwargs.get("url_or_file"))
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        entered.set()
+        release.wait(timeout=5)
+        for name, body in (("out.txt", "x"), ("out.srt", "1\n"), ("out.vtt", "WEBVTT\n"), ("out.json", "{}")):
+            (out / name).write_text(body, encoding="utf-8")
+        return str(out)
+
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", max_queue=1, job_root=str(job_root))
+    app = create_app(cfg, transcribe_fn=blocking)
+    try:
+        with TestClient(app) as client:
+            j1 = client.post("/v1/transcribe", json={"url": "https://a"}).json()["job_id"]
+            assert entered.wait(timeout=2)
+            j2 = client.post("/v1/transcribe", json={"url": "https://b"}).json()["job_id"]  # fills the queue
+
+            body = {"url": "https://c", "language": "en"}
+            r1 = client.post("/v1/transcribe", json=body, headers={"Idempotency-Key": "rolled"})
+            assert r1.status_code == 429, r1.text
+            # Reservation was rolled back: the same key gives 429 again,
+            # not 409 ("key in flight / already used").
+            r2 = client.post("/v1/transcribe", json=body, headers={"Idempotency-Key": "rolled"})
+            assert r2.status_code == 429, r2.text
+
+            # No orphaned upload directories from the two rejected attempts.
+            assert len(_job_dirs(job_root)) == 2
+
+            # Drain the queue, then reuse the rolled-back key while the same
+            # daemon (and its worker) is still running.
+            release.set()
+            _wait_for_status(client, j1)
+            _wait_for_status(client, j2)
+            r3 = client.post("/v1/transcribe", json=body, headers={"Idempotency-Key": "rolled"})
+            assert r3.status_code == 202, r3.text
+            _wait_for_status(client, r3.json()["job_id"])
+    finally:
+        release.set()
+
+    assert len(calls) == 3, calls  # a, b, c — the 429s never inferred
+    assert len(_job_dirs(job_root)) == 3
+
+
+def test_invalid_idempotency_key_header_rejected(tmp_path) -> None:
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(tmp_path))
+    app = create_app(cfg, transcribe_fn=_fake_transcribe_factory())
+    with TestClient(app) as client:
+        assert client.post("/v1/transcribe", json={"url": "https://x"}, headers={"Idempotency-Key": "k" * 256}).status_code == 400
+        assert client.post("/v1/transcribe", json={"url": "https://x"}, headers={"Idempotency-Key": "bad\nkey"}).status_code == 400
+        # Whitespace-only behaves like "no key" — normal 202.
+        assert client.post("/v1/transcribe", json={"url": "https://x"}, headers={"Idempotency-Key": "   "}).status_code == 202
+
+
+def test_failed_job_is_still_deduped_within_retention(tmp_path) -> None:
+    """Retrying a key whose original job failed replays it instead of re-inferring."""
+    calls: list = []
+
+    def boom(*_a, **_kw):
+        calls.append("called")
+        raise RuntimeError("boom")
+
+    cfg = ServerConfig(host="127.0.0.1", model="tiny", job_root=str(tmp_path))
+    app = create_app(cfg, transcribe_fn=boom)
+    with TestClient(app) as client:
+        r1 = client.post("/v1/transcribe", json={"url": "https://x"}, headers={"Idempotency-Key": "fail"})
+        job_id = r1.json()["job_id"]
+        final = _wait_for_status(client, job_id)
+        assert final["status"] == "failed"
+        r2 = client.post("/v1/transcribe", json={"url": "https://x"}, headers={"Idempotency-Key": "fail"})
+        assert r2.status_code == 202
+        assert r2.json()["job_id"] == job_id
+        assert len(calls) == 1
+
+
+# --------------------- Idempotency store semantics ---------------------
+
+
+def _store_with_job(store: JobStore, job_id: str = "j1", key: str = "k", fingerprint: str = "fp") -> None:
+    assert store.reserve_idempotency_key(key) is None
+    store.commit_idempotency_record(key, fingerprint, job_id, {"job_id": job_id, "status": "queued", "status_url": f"/v1/jobs/{job_id}"})
+
+
+def test_idempotency_record_replays_within_ttl() -> None:
+    cfg = ServerConfig(artifact_ttl_seconds=3600)
+    store = JobStore(cfg, transcribe_fn=lambda **_kw: "")
+    _store_with_job(store)
+    record = store.reserve_idempotency_key("k")
+    assert record is not None
+    assert record.state == IDEMPOTENCY_COMMITTED
+    assert record.fingerprint == "fp"
+    assert record.response["job_id"] == "j1"
+
+
+def test_idempotency_record_expires_after_retention_window() -> None:
+    cfg = ServerConfig(artifact_ttl_seconds=0)
+    store = JobStore(cfg, transcribe_fn=lambda **_kw: "")
+    _store_with_job(store)
+    store.sweep_expired_idempotency()
+    assert store.get_idempotency_record("k") is None
+    # Expired record behaves as a free key (scope bounded by retention).
+    assert store.reserve_idempotency_key("k") is None
+
+
+def test_release_idempotency_key_makes_key_reusable() -> None:
+    cfg = ServerConfig()
+    store = JobStore(cfg, transcribe_fn=lambda **_kw: "")
+    assert store.reserve_idempotency_key("k") is None
+    store.release_idempotency_key("k")  # simulates a queue-full rollback
+    assert store.get_idempotency_record("k") is None
+    assert store.reserve_idempotency_key("k") is None
+
+
+def test_delete_job_drops_idempotency_record(tmp_path) -> None:
+    cfg = ServerConfig(job_root=str(tmp_path))
+    store = JobStore(cfg, transcribe_fn=lambda **_kw: "")
+    store.start()
+    try:
+        job = store.submit({"input": "https://x"}, str(tmp_path / "j"))
+        _store_with_job(store, job_id=job.job_id, key="dk")
+        assert store.get_idempotency_record("dk") is not None
+        assert store.delete(job.job_id) is True
+        assert store.get_idempotency_record("dk") is None
+    finally:
+        store.stop()

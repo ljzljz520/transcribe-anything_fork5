@@ -263,6 +263,16 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument(
+        "--idempotency-key",
+        help=(
+            "Optional Idempotency-Key for --remote submissions. Retries (including the client's own "
+            "bounded retries after a lost response) reuse the same key: identical media+parameters "
+            "enqueue exactly once, while a reused key with different media/parameters is rejected "
+            "with 409. One is generated automatically when unset."
+        ),
+        default=None,
+    )
+    parser.add_argument(
         "--stream-in",
         action="store_true",
         help=(
@@ -441,6 +451,7 @@ def main() -> int:
                 align_model=align_model if align else None,
                 other_args=unknown,
                 embed=args.embed,
+                idempotency_key=getattr(args, "idempotency_key", None),
             )
         except KeyboardInterrupt:
             print("KeyboardInterrupt")
